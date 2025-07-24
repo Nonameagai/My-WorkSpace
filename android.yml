@@ -1,0 +1,24 @@
+services:
+  android:
+    image: budtmo/docker-android-x86
+    container_name: android
+    environment:
+      - DEVICE=Pixel_4
+      - USERNAME=flare
+      - PASSWORD=123456@
+    privileged: true
+    devices:
+      - /dev/kvm
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "8006:6080" # VNC hoặc noVNC
+      - "5554:5554" # ADB
+      - "5555:5555" # ADB
+    volumes:
+      - android-data:/home/androidusr
+    stop_grace_period: 2m
+
+volumes:
+  android-data:
