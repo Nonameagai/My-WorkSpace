@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Aurora Flow — WebGL Art with Bloom</title>
+<style>
+  :root {
+    --bg: #0b0f14;
+    --fg: #e8eef6;
+    --muted: #96a2b4;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    height: 100%;
+    overflow: hidden;
+    font: 14px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+  }
+  .hud {
+    position: fixed;
+    left: 14px; bottom: 14px;
+    background: color-mix(in oklab, black 40%, transparent);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    color: var(--fg);
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.07);
+    user-select: none;
+    pointer-events: none;
+    max-width: min(560px, 80vw);
+    box-shadow: 0 8px 30px rgba(0,0,0,0.35);
+    transition: opacity .25s ease;
+  }
+  .hud.hide { opacity: 0; }
+  .hud .title {
+    font-weight: 600;
+    letter-spacing: .2px;
+    margin-bottom: 4px;
+  }
+  .hud .meta {
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 8px;
+  }
+  .hud kbd {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.1);
+    padding: 1px 6px;
+    border-radius: 6px;
+    font-size: 12px;
+    box-shadow: inset 0 -1px 0 rgba(255,255,255,0.05);
+    margin-right: 4px;
+  }
+  .hud .row { margin-top: 6px; color: var(--muted); }
+  .hud .row strong { color: var(--fg); }
+  .corner {
+    position: fixed;
+    right: 14px; top: 14px;
+    color: var(--muted);
+    background: color-mix(in oklab, black 40%, transparent);
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 10px;
+    padding: 6px 10px;
+    pointer-events: none;
+    font-size: 12px;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+  }
+  @media (max-width: 640px) {
+    .hud { font-size: 13px; }
+    .hud .meta { font-size: 11px; }
+    .corner { font-size: 11px; }
+  }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<div class="corner" id="corner">0×0 @ 1.00×</div>
+<div class="hud" id="hud">
+  <div class="title">Aurora Flow</div>
+  <div class="meta">Interactive domain‑warped noise with bloom & filmic tone mapping. WebGL1, no libraries.</div>
+  <div class="row"><kbd>Click / Tap</kbd> cycle palette • <kbd>R</kbd> randomize • <kbd>S</kbd> save snapshot • <kbd>H</kbd> hide help</div>
+  <div class="row">Palette: <strong id="palName">Aurora</strong> • Quality: <strong id="quality">auto</strong></div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // --------- Setup
+  const canvas = document.getElementById('gl');
+  /** @type {WebGLRenderingContext} */
+  const gl = canvas.getContext('webgl', {
+    antialias: false,
+    alpha: false,
+    depth: false,
+    stencil: false,
+    preserveDrawingBuffer: true, // allow snapshots
+    powerPreference: 'high-performance',
+  });
+
+  if (!gl) {
+    const msg = document.createElement('div');
+    msg.style.cssText = "position:fixed;inset:0;display:grid;place-items:center;color:white;background:#111";
+    msg.innerHTML = "<div>WebGL not available in this browser.</div>";
+    document.body.appendChild(msg);
+    return;
+  }
+
+  // Utilities
+  const dprCap = 2; // cap DPR for sanity/perf
+  let renderScale = 1; // adaptive internal scale (0.5–1.0)
+  let targetFPS = 60;
+  let frameTimes = [];
+  let lastAdapt = performance.now();
+
+  const corner = document.getElementById('corner');
+  const hud = document.getElementById('hud');
+  const palNameEl = document.getElementById('palName');
+  const qualityEl = document.getElementById('quality');
+
+  // Fullscreen quad (two triangles)
+  const quad = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.bufferData(
+    gl.ARRAY_BUFFER,
+    new Float32Array([
+      -1, -1,  1, -1, -1,  1,
+      -1,  1,  1, -1,  1,  1,
+    ]),
+    gl.STATIC_DRAW
+  );
+
+  function compile(type, src) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(sh);
+      console.error(log, src);
+      throw new Error('Shader compile failed: ' + log);
+    }
+    return sh;
+  }
+  function link(vs, fs) {
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.bindAttribLocation(prog, 0, "a_position");
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      const log = gl.getProgramInfoLog(prog);
+      console.error(log);
+      throw new Error('Program link failed: ' + log);
+    }
+    return prog;
+  }
+  function createTex(w, h, filter=gl.LINEAR) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    return tex;
+  }
+  function createFBO(w, h, filter=gl.LINEAR) {
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    const tex = createTex(w, h, filter);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+      throw new Error('Framebuffer incomplete');
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { fbo, tex, w, h };
+  }
+  function setViewportFBO(target) {
+    if (target) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+      gl.viewport(0, 0, target.w, target.h);
+    } else {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    }
+  }
+
+  // --------- Shaders
+
+  // Vertex shader for fullscreen quad
+  const VS = `
+    attribute vec2 a_position;
+    varying vec2 v_uv;
+    void main() {
+      v_uv = a_position * 0.5 + 0.5;
+      gl_Position = vec4(a_position, 0.0, 1.0);
+    }
+  `;
+
+  // Fragment shader: domain‑warped noise field (scene)
+  const FS_SCENE = `
+    precision highp float;
+    varying vec2 v_uv;
+
+    uniform vec2  uResolution;
+    uniform float uTime;
+    uniform vec2  uPointer;      // 0..1
+    uniform float uWarpAmp;      // 0.0..1.5
+    uniform float uSwirl;        // 0.0..2.0
+    uniform float uZoom;         // 0.5..2.0
+    uniform int   uPalette;      // palette index
+    uniform vec2  uJitter;       // dithering
+    uniform float uEnergy;       // motion energy
+
+    // ---- Simplex noise 3D (Ashima Arts, public domain)
+    vec3 mod289(vec3 x){ return x - floor(x * (1.0 / 289.0)) * 289.0; }
+    vec4 mod289(vec4 x){ return x - floor(x * (1.0 / 289.0)) * 289.0; }
+    vec4 permute(vec4 x){ return mod289(((x*34.0)+1.0)*x); }
+    vec4 taylorInvSqrt(vec4 r){ return 1.79284291400159 - 0.85373472095314 * r; }
+    float snoise(vec3 v){
+      const vec2  C = vec2(1.0/6.0, 1.0/3.0);
+      const vec4  D = vec4(0.0, 0.5, 1.0, 2.0);
+      // First corner
+      vec3 i  = floor(v + dot(v, C.yyy) );
+      vec3 x0 = v - i + dot(i, C.xxx) ;
+      // Other corners
+      vec3 g = step(x0.yzx, x0.xyz);
+      vec3 l = 1.0 - g;
+      vec3 i1 = min( g.xyz, l.zxy );
+      vec3 i2 = max( g.xyz, l.zxy );
+      vec3 x1 = x0 - i1 + 1.0 * C.xxx;
+      vec3 x2 = x0 - i2 + 2.0 * C.xxx;
+      vec3 x3 = x0 - 1.0 + 3.0 * C.xxx;
+      // Permutations
+      i = mod289(i);
+      vec4 p = permute( permute( permute(
+                i.z + vec4(0.0, i1.z, i2.z, 1.0 ))
+              + i.y + vec4(0.0, i1.y, i2.y, 1.0 ))
+              + i.x + vec4(0.0, i1.x, i2.x, 1.0 ));
+      // Gradients
+      float n_ = 0.142857142857;
+      vec3  ns = n_ * D.wyz - D.xzx;
+
+      vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+      vec4 x_ = floor(j * ns.z);
+      vec4 y_ = floor(j - 7.0 * x_ );
+      vec4 x = x_ * ns.x + ns.yyyy;
+      vec4 y = y_ * ns.x + ns.yyyy;
+      vec4 h = 1.0 - abs(x) - abs(y);
+      vec4 b0 = vec4( x.xy, y.xy );
+      vec4 b1 = vec4( x.zw, y.zw );
+
+      vec4 s0 = floor(b0)*2.0 + 1.0;
+      vec4 s1 = floor(b1)*2.0 + 1.0;
+      vec4 sh = -step(h, vec4(0.0));
+
+      vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy ;
+      vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww ;
+
+      vec3 p0 = vec3(a0.xy,h.x);
+      vec3 p1 = vec3(a0.zw,h.y);
+      vec3 p2 = vec3(a1.xy,h.z);
+      vec3 p3 = vec3(a1.zw,h.w);
+
+      vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+      p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+
+      vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1),
+                               dot(x2,x2), dot(x3,x3)), 0.0);
+      m = m*m;
+      return 42.0 * dot( m*m, vec4( dot(p0,x0), dot(p1,x1),
+                                    dot(p2,x2), dot(p3,x3) ) );
+    }
+
+    float fbm(vec3 p) {
+      float v = 0.0;
+      float a = 0.5;
+      for (int i=0; i<5; i++) {
+        v += a * snoise(p);
+        p *= 2.0;
+        a *= 0.5;
+      }
+      return v;
+    }
+
+    // IQ cosine palette
+    vec3 pal(float t, vec3 a, vec3 b, vec3 c, vec3 d) {
+      return a + b * cos(6.2831853 * (c * t + d));
+    }
+
+    vec3 paletteName(int i) { // not used here (JS updates name), kept for clarity
+      return vec3(float(i));
+    }
+
+    vec3 getPalette(float t, int idx) {
+      // Several hand-tuned looks
+      if (idx == 0) { // Aurora
+        return pal(t, vec3(0.45,0.50,0.55), vec3(0.55,0.45,0.60),
+                      vec3(1.00,0.50,0.25), vec3(0.00,0.15,0.20));
+      } else if (idx == 1) { // Neon Sunset
+        return pal(t, vec3(0.50,0.40,0.35), vec3(0.50,0.55,0.65),
+                      vec3(1.00,0.80,0.60), vec3(0.05,0.20,0.00));
+      } else if (idx == 2) { // Deep Ocean
+        return pal(t, vec3(0.20,0.35,0.45), vec3(0.30,0.40,0.55),
+                      vec3(0.70,0.60,0.50), vec3(0.20,0.05,0.15));
+      } else if (idx == 3) { // Magma
+        return pal(t, vec3(0.25,0.20,0.16), vec3(0.70,0.55,0.40),
+                      vec3(1.00,0.90,0.70), vec3(0.00,0.05,0.30));
+      } else { // Icefire
+        return pal(t, vec3(0.40,0.45,0.55), vec3(0.60,0.55,0.50),
+                      vec3(1.00,0.60,0.10), vec3(0.25,0.00,0.00));
+      }
+    }
+
+    float luminance(vec3 c) { return dot(c, vec3(0.2126,0.7152,0.0722)); }
+
+    vec2 rotateAround(vec2 p, vec2 c, float a) {
+      float cs = cos(a), sn = sin(a);
+      vec2 d = p - c;
+      return c + mat2(cs, -sn, sn, cs) * d;
+    }
+
+    void main() {
+      // Aspect-corrected coordinates in [-1,1]
+      vec2 uv = v_uv * 2.0 - 1.0;
+      uv.x *= uResolution.x / uResolution.y;
+
+      // Pointer in same space
+      vec2 mp = uPointer * 2.0 - 1.0;
+      mp.x *= uResolution.x / uResolution.y;
+
+      // Base transform / zoom and gentle drift
+      float t = uTime;
+      vec2 p = uv * uZoom;
+      p += 0.03 * vec2(sin(t*0.17), cos(t*0.13));
+
+      // Domain warp from simplex noise
+      vec3 q = vec3(p * (1.2 + 0.6*sin(t*0.07)), t * (0.10 + 0.25*uEnergy));
+      vec2 warp = vec2(snoise(q + 0.0), snoise(q + 37.0));
+      p += warp * uWarpAmp;
+
+      // Local swirl influenced by pointer proximity
+      float r = length(p - mp);
+      float swirl = uSwirl * smoothstep(0.65, 0.0, r);
+      p = rotateAround(p, mp, swirl * (1.0 + 0.25*snoise(vec3(p*2.0, t*0.3))));
+
+      // Two-layer fbm with opposing time to create parallax shimmer
+      float n1 = fbm(vec3(p*1.2,  t*0.15));
+      float n2 = fbm(vec3(p*2.6, -t*0.10));
+      float n = mix(n1, n2, 0.5 + 0.5*sin(t*0.2));
+
+      // Ridge detail
+      float ridges = 0.5 + 0.5 * abs(fbm(vec3(p*3.5, t*0.25)));
+      float tcol = clamp(0.5 + 0.5*n, 0.0, 1.0);
+
+      // Palette and glow shaping
+      vec3 base = getPalette(tcol, uPalette);
+      float glow = smoothstep(0.70, 1.00, tcol) + 0.35*ridges;
+
+      // Subtle blue-noise style dither to fight banding
+      float d = fract(sin(dot((v_uv + uJitter) * uResolution, vec2(12.9898,78.233))) * 43758.5453);
+      base += (d - 0.5) * 0.006;
+
+      // Boost highlights (for bright-pass bloom later)
+      vec3 col = base * (0.9 + 0.4*glow);
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `;
+
+  // Bright-pass (extract highlights for bloom)
+  const FS_BRIGHT = `
+    precision mediump float;
+    varying vec2 v_uv;
+    uniform sampler2D uScene;
+    uniform float uThreshold; // 0..1
+    void main() {
+      vec3 col = texture2D(uScene, v_uv).rgb;
+      float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+      float w = smoothstep(uThreshold, 1.0, lum);
+      gl_FragColor = vec4(col * w, 1.0);
+    }
+  `;
+
+  // Kawase/Gaussian-ish 2-pass blur (few taps, fast)
+  const FS_BLUR = `
+    precision mediump float;
+    varying vec2 v_uv;
+    uniform sampler2D uTex;
+    uniform vec2 uTexel;     // 1/width, 1/height
+    uniform vec2 uDirection; // (1,0) or (0,1)
+    void main() {
+      vec2 off = uDirection * uTexel;
+
+      // 5 taps, approximated gaussian
+      vec3 sum = texture2D(uTex, v_uv).rgb * 0.2270270270;
+      sum += texture2D(uTex, v_uv + 1.3846153846*off).rgb * 0.3162162162;
+      sum += texture2D(uTex, v_uv - 1.3846153846*off).rgb * 0.3162162162;
+      sum += texture2D(uTex, v_uv + 3.2307692308*off).rgb * 0.0702702703;
+      sum += texture2D(uTex, v_uv - 3.2307692308*off).rgb * 0.0702702703;
+      gl_FragColor = vec4(sum, 1.0);
+    }
+  `;
+
+  // Composite: base + bloom, vignette, chromatic aberration, ACES filmic tonemap
+  const FS_COMPOSE = `
+    precision mediump float;
+    varying vec2 v_uv;
+    uniform sampler2D uScene;
+    uniform sampler2D uBloom;
+    uniform vec2 uResolution;
+    uniform float uBloomStrength;
+    uniform float uChromAb; // chromatic aberration strength
+    uniform float uVignette;
+
+    vec3 ACESFilm(vec3 x) {
+      // ACES approximation
+      float a=2.51, b=0.03, c=2.43, d=0.59, e=0.14;
+      return clamp((x*(a*x + b)) / (x*(c*x + d) + e), 0.0, 1.0);
+    }
+
+    void main() {
+      vec2 uv = v_uv;
+
+      // Slight radial chromatic aberration from center
+      vec2 center = vec2(0.5);
+      vec2 dir = uv - center;
+      float r = length(dir);
+      vec2 ca = dir * (uChromAb * pow(r, 1.6));
+
+      float rCh = texture2D(uScene, uv - ca).r;
+      float gCh = texture2D(uScene, uv).g;
+      float bCh = texture2D(uScene, uv + ca).b;
+      vec3 scene = vec3(rCh, gCh, bCh);
+
+      vec3 bloom = texture2D(uBloom, uv).rgb;
+
+      vec3 col = scene + bloom * uBloomStrength;
+
+      // Vignette
+      float asp = uResolution.x / uResolution.y;
+      vec2 p = (uv * 2.0 - 1.0) * vec2(asp, 1.0);
+      float vig = 1.0 - uVignette * dot(p, p);
+      col *= clamp(vig, 0.0, 1.0);
+
+      // Tonemap + gamma
+      col = ACESFilm(col);
+      col = pow(col, vec3(1.0/2.2));
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `;
+
+  // Build programs
+  const progScene = link(compile(gl.VERTEX_SHADER, VS), compile(gl.FRAGMENT_SHADER, FS_SCENE));
+  const progBright = link(compile(gl.VERTEX_SHADER, VS), compile(gl.FRAGMENT_SHADER, FS_BRIGHT));
+  const progBlur = link(compile(gl.VERTEX_SHADER, VS), compile(gl.FRAGMENT_SHADER, FS_BLUR));
+  const progCompose = link(compile(gl.VERTEX_SHADER, VS), compile(gl.FRAGMENT_SHADER, FS_COMPOSE));
+
+  // Lookups
+  function loc(prog, name) { const l = gl.getUniformLocation(prog, name); if (l === null) console.warn('missing uniform', name); return l; }
+
+  // Scene uniforms
+  const uS = {
+    res: loc(progScene, 'uResolution'),
+    time: loc(progScene, 'uTime'),
+    pointer: loc(progScene, 'uPointer'),
+    warp: loc(progScene, 'uWarpAmp'),
+    swirl: loc(progScene, 'uSwirl'),
+    zoom: loc(progScene, 'uZoom'),
+    palette: loc(progScene, 'uPalette'),
+    jitter: loc(progScene, 'uJitter'),
+    energy: loc(progScene, 'uEnergy'),
+  };
+  // Bright uniforms
+  const uBrt = {
+    tex: gl.getUniformLocation(progBright, 'uScene'),
+    thr: gl.getUniformLocation(progBright, 'uThreshold'),
+  };
+  // Blur uniforms
+  const uBlur = {
+    tex: gl.getUniformLocation(progBlur, 'uTex'),
+    texel: gl.getUniformLocation(progBlur, 'uTexel'),
+    dir: gl.getUniformLocation(progBlur, 'uDirection'),
+  };
+  // Compose uniforms
+  const uC = {
+    scene: gl.getUniformLocation(progCompose, 'uScene'),
+    bloom: gl.getUniformLocation(progCompose, 'uBloom'),
+    res: gl.getUniformLocation(progCompose, 'uResolution'),
+    bloomStrength: gl.getUniformLocation(progCompose, 'uBloomStrength'),
+    chromAb: gl.getUniformLocation(progCompose, 'uChromAb'),
+    vignette: gl.getUniformLocation(progCompose, 'uVignette'),
+  };
+
+  // Attributes
+  function bindQuad(prog) {
+    gl.useProgram(prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+    const loc = 0;
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  }
+
+  // Render targets (created in resize)
+  let fboScene, fboBright, fboPing, fboPong;
+
+  // Interaction state
+  let pointer = { x: 0.5, y: 0.5, down: false, lastMove: performance.now() };
+  let smoothPtr = { x: 0.5, y: 0.5 };
+  let autopilot = true;
+
+  const PALETTES = ["Aurora", "Neon Sunset", "Deep Ocean", "Magma", "Icefire"];
+  let paletteIndex = 0;
+  palNameEl.textContent = PALETTES[paletteIndex];
+
+  // Tunables (live randomized by 'R')
+  const params = {
+    warpAmp: 0.75,
+    swirl: 1.2,
+    zoom: 1.0,
+    energy: 1.0,
+    brightThreshold: 0.65,
+    bloomStrength: 1.15,
+    chromAb: 0.0025,
+    vignette: 0.22
+  };
+
+  // Resize / DPR
+  function resize() {
+    const DPR = Math.min(window.devicePixelRatio || 1, dprCap);
+    const scale = renderScale;
+    const w = Math.max(1, Math.floor(innerWidth * DPR * scale));
+    const h = Math.max(1, Math.floor(innerHeight * DPR * scale));
+    canvas.width = Math.max(1, Math.floor(innerWidth * DPR));
+    canvas.height = Math.max(1, Math.floor(innerHeight * DPR));
+
+    // Recreate FBOs at internal resolution (scaled)
+    fboScene && gl.deleteFramebuffer(fboScene.fbo);
+    fboBright && gl.deleteFramebuffer(fboBright.fbo);
+    fboPing && gl.deleteFramebuffer(fboPing.fbo);
+    fboPong && gl.deleteFramebuffer(fboPong.fbo);
+
+    fboScene = createFBO(w, h, gl.LINEAR);
+    fboBright = createFBO(w, h, gl.LINEAR);
+    // Blur can use slightly lower res for speed; use same for simplicity
+    fboPing = createFBO(w, h, gl.LINEAR);
+    fboPong = createFBO(w, h, gl.LINEAR);
+
+    gl.viewport(0, 0, canvas.width, canvas.height);
+
+    corner.textContent = `${canvas.width}×${canvas.height} @ ${scale.toFixed(2)}×`;
+  }
+  window.addEventListener('resize', resize, { passive: true });
+
+  // Pointer handling
+  function setPointer(e) {
+    let x, y;
+    if (e.touches && e.touches.length) {
+      x = e.touches[0].clientX;
+      y = e.touches[0].clientY;
+    } else {
+      x = e.clientX; y = e.clientY;
+    }
+    pointer.x = x / innerWidth;
+    pointer.y = 1.0 - y / innerHeight;
+    pointer.lastMove = performance.now();
+  }
+  window.addEventListener('pointermove', setPointer, { passive: true });
+  window.addEventListener('touchmove', setPointer, { passive: true });
+  window.addEventListener('pointerdown', (e) => { pointer.down = true; setPointer(e); cyclePalette(); });
+  window.addEventListener('pointerup', () => { pointer.down = false; });
+  window.addEventListener('touchstart', (e) => { setPointer(e); cyclePalette(); }, { passive: true });
+
+  function cyclePalette() {
+    paletteIndex = (paletteIndex + 1) % PALETTES.length;
+    palNameEl.textContent = PALETTES[paletteIndex];
+  }
+
+  // Keyboard
+  window.addEventListener('keydown', (e) => {
+    if (e.repeat) return;
+    if (e.key === 'h' || e.key === 'H') {
+      hud.classList.toggle('hide');
+    } else if (e.key === 's' || e.key === 'S') {
+      savePNG();
+    } else if (e.key === 'r' || e.key === 'R') {
+      randomize();
+    } else if (e.key === ' ') {
+      autopilot = !autopilot;
+    } else if (e.key === 'ArrowRight') {
+      cyclePalette();
+    } else if (e.key === 'ArrowLeft') {
+      paletteIndex = (paletteIndex + PALETTES.length - 1) % PALETTES.length;
+      palNameEl.textContent = PALETTES[paletteIndex];
+    }
+  });
+
+  function randomize() {
+    params.warpAmp = 0.45 + Math.random() * 1.15;
+    params.swirl = 0.6 + Math.random() * 1.8;
+    params.zoom = 0.8 + Math.random() * 0.6;
+    params.energy = 0.7 + Math.random() * 1.6;
+    params.brightThreshold = 0.55 + Math.random() * 0.25;
+    params.bloomStrength = 0.9 + Math.random() * 1.5;
+    params.chromAb = 0.001 + Math.random() * 0.004;
+    params.vignette = 0.15 + Math.random() * 0.25;
+  }
+
+  function savePNG() {
+    // Temporarily draw a full-res composite (using current canvas) and save
+    const a = document.createElement('a');
+    a.download = `aurora-flow-${Date.now()}.png`;
+    a.href = canvas.toDataURL('image/png');
+    a.click();
+  }
+
+  // Adaptive quality (keeps animation smooth)
+  function adaptQuality(now) {
+    frameTimes.push(now);
+    // keep last ~1s
+    while (frameTimes.length && now - frameTimes[0] > 1000) frameTimes.shift();
+    if (now - lastAdapt < 800) return;
+
+    const fps = frameTimes.length * 1000 / (frameTimes.length ? (now - frameTimes[0]) : 1000);
+    if (fps < targetFPS * 0.82 && renderScale > 0.6) {
+      renderScale = Math.max(0.6, renderScale - 0.05);
+      qualityEl.textContent = 'auto ↓';
+      resize();
+    } else if (fps > targetFPS * 0.95 && renderScale < 1.0) {
+      renderScale = Math.min(1.0, renderScale + 0.05);
+      qualityEl.textContent = renderScale < 0.999 ? 'auto ↑' : 'auto';
+      resize();
+    }
+    lastAdapt = now;
+    corner.textContent = `${canvas.width}×${canvas.height} @ ${renderScale.toFixed(2)}×`;
+  }
+
+  // Initial sizing
+  resize();
+
+  // Animation loop
+  let start = performance.now();
+  function loop(now) {
+    const t = (now - start) / 1000;
+
+    // Smooth pointer: follow user; if idle, autopilot lissajous path
+    const idle = now - pointer.lastMove > 3000;
+    const ap = autopilot || idle;
+    const ax = 0.5 + 0.35 * Math.sin(t * 0.47) * Math.cos(t * 0.21);
+    const ay = 0.5 + 0.35 * Math.sin(t * 0.33 + 0.7) * Math.cos(t * 0.18 + 1.9);
+    const targetX = ap ? ax : pointer.x;
+    const targetY = ap ? ay : pointer.y;
+
+    // critically damped smoothing
+    smoothPtr.x += (targetX - smoothPtr.x) * 0.06;
+    smoothPtr.y += (targetY - smoothPtr.y) * 0.06;
+
+    // 1) Scene pass
+    setViewportFBO(fboScene);
+    bindQuad(progScene);
+    gl.uniform2f(uS.res, fboScene.w, fboScene.h);
+    gl.uniform1f(uS.time, t);
+    gl.uniform2f(uS.pointer, smoothPtr.x, smoothPtr.y);
+    gl.uniform1f(uS.warp, params.warpAmp);
+    gl.uniform1f(uS.swirl, params.swirl);
+    gl.uniform1f(uS.zoom, params.zoom);
+    gl.uniform1i(uS.palette, paletteIndex);
+    gl.uniform2f(uS.jitter, Math.random(), Math.random());
+    gl.uniform1f(uS.energy, params.energy);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // 2) Bright pass
+    setViewportFBO(fboBright);
+    bindQuad(progBright);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, fboScene.tex);
+    gl.uniform1i(uBrt.tex, 0);
+    gl.uniform1f(uBrt.thr, params.brightThreshold);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // 3) Blur ping (horizontal)
+    setViewportFBO(fboPing);
+    bindQuad(progBlur);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, fboBright.tex);
+    gl.uniform1i(uBlur.tex, 0);
+    gl.uniform2f(uBlur.texel, 1 / fboBright.w, 1 / fboBright.h);
+    gl.uniform2f(uBlur.dir, 1, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // 4) Blur pong (vertical)
+    setViewportFBO(fboPong);
+    bindQuad(progBlur);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, fboPing.tex);
+    gl.uniform1i(uBlur.tex, 0);
+    gl.uniform2f(uBlur.texel, 1 / fboPing.w, 1 / fboPing.h);
+    gl.uniform2f(uBlur.dir, 0, 1);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // 5) Composite to screen
+    setViewportFBO(null);
+    bindQuad(progCompose);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, fboScene.tex);
+    gl.uniform1i(uC.scene, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, fboPong.tex);
+    gl.uniform1i(uC.bloom, 1);
+    gl.uniform2f(uC.res, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    gl.uniform1f(uC.bloomStrength, params.bloomStrength);
+    gl.uniform1f(uC.chromAb, params.chromAb);
+    gl.uniform1f(uC.vignette, params.vignette);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    adaptQuality(now);
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  // Context loss handling
+  canvas.addEventListener('webglcontextlost', (e) => {
+    e.preventDefault();
+    console.warn('WebGL context lost');
+  });
+  canvas.addEventListener('webglcontextrestored', () => {
+    console.warn('WebGL context restored');
+    resize();
+  });
+})();
+</script>
+</body>
+</html>
