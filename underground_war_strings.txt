@@ -1,0 +1,21 @@
+string
+char
+byte
+sub
+bit32
+bit
+bxor
+table
+concat
+insert
+match
+tonumber
+pcall
+:%d+:
+%d+
+loadstring
+game
+HttpGet
+Ù×Ï5õáQÖÊÈ1¨¼Î
+ÙÖÙ0õ¾ÕÞÍÏ è¯ÞÎñ³ÐFÜw¿¬ÏQÆsâìÆØ&¶¾NÔpà¾ÅIØp·èÆOÑÚ2©ºOÅ'´éMÔ'µïÆNÐq¶¾ÐÚ#ã¾MÐpäôÔ	ÞÑß`´îN×ÊÜ-òþKÚ0ôº
+~±£»EÛ§
